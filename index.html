@@ -200,6 +200,559 @@
     import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
     import { getFirestore, collection, onSnapshot, addDoc, doc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
+    // VOS CLÉS EXACTES (Corrige l'erreur du "a" remplacé par un "e" dans l'appId)
+    const firebaseConfig = {
+      apiKey: "AIzaSyAY_3CtJx2nngIZlKBjiwk0EFSDGds-sB0",
+      authDomain: "location-de-bob.firebaseapp.com",
+      projectId: "location-de-bob",
+      storageBucket: "location-de-bob.firebasestorage.app",
+      messagingSenderId: "189513962873",
+      appId: "1:189513962873:web:ce60f5eb81e334fec40ba8" 
+    };
+
+    // Initialisation
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    // Variables globales
+    const state = {
+      user: null,
+      dbStatus: 'connecting', // connecting | online | error
+      currentMonth: new Date(),
+      selection: { start: null, end: null },
+      options: { cooler: false, shower: false, bed: false },
+      userName: '',
+      comment: '',
+      successMessage: '',
+      errorMsg: '',
+      bookings: [],
+      isAdmin: false,
+      adminCode: "BOB2024" // MOT DE PASSE POUR LE TABLEAU DE BORD
+    };
+
+    const monthNames = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"];
+    const dayNames = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"];
+
+    // Utilitaires de Pop-up personnalisées
+    const showModal = ({ title, desc, showInput = false, confirmText = "Confirmer" }) => {
+      return new Promise((resolve) => {
+        const modal = document.getElementById('custom-modal');
+        const titleEl = document.getElementById('modal-title');
+        const descEl = document.getElementById('modal-desc');
+        const inputContainer = document.getElementById('modal-input-container');
+        const inputEl = document.getElementById('modal-input');
+        const errorEl = document.getElementById('modal-error');
+        const btnCancel = document.getElementById('btn-modal-cancel');
+        const btnConfirm = document.getElementById('btn-modal-confirm');
+
+        titleEl.innerText = title;
+        descEl.innerText = desc;
+        btnConfirm.innerText = confirmText;
+        errorEl.classList.add('hidden');
+        inputEl.value = '';
+
+        if (showInput) {
+          inputContainer.classList.remove('hidden');
+          setTimeout(() => inputEl.focus(), 100);
+        } else {
+          inputContainer.classList.add('hidden');
+        }
+
+        modal.classList.remove('hidden');
+
+        const cleanup = () => {
+          modal.classList.add('hidden');
+          btnCancel.onclick = null;
+          btnConfirm.onclick = null;
+        };
+
+        btnCancel.onclick = () => { cleanup(); resolve({ confirmed: false }); };
+        
+        btnConfirm.onclick = () => {
+          if (showInput && inputEl.value.trim() === '') {
+            errorEl.innerText = "Veuillez remplir ce champ.";
+            errorEl.classList.remove('hidden');
+            return;
+          }
+          cleanup();
+          resolve({ confirmed: true, value: inputEl.value });
+        };
+      });
+    };
+
+    const normalizeDate = (date) => {
+      const d = new Date(date);
+      d.setHours(0, 0, 0, 0);
+      return d;
+    };
+    const isSameDay = (d1, d2) => d1 && d2 && normalizeDate(d1).getTime() === normalizeDate(d2).getTime();
+    const isDateBetween = (date, start, end) => start && end && normalizeDate(date).getTime() > normalizeDate(start).getTime() && normalizeDate(date).getTime() < normalizeDate(end).getTime();
+    
+    const isDateBooked = (date) => {
+      const dTime = normalizeDate(date).getTime();
+      return state.bookings.some(b => dTime >= normalizeDate(b.start).getTime() && dTime <= normalizeDate(b.end).getTime());
+    };
+
+    const hasBookingBetween = (start, end) => {
+      const s = normalizeDate(start).getTime();
+      const e = normalizeDate(end).getTime();
+      return state.bookings.some(b => {
+        return (normalizeDate(b.start).getTime() <= e && normalizeDate(b.end).getTime() >= s);
+      });
+    };
+
+    const updateUI = () => {
+      // 1. Voyant Firebase
+      const dot = document.getElementById('db-status-dot');
+      const text = document.getElementById('db-status-text');
+      
+      if (state.dbStatus === 'connecting') {
+        dot.className = "w-2 h-2 rounded-full bg-yellow-400 animate-pulse";
+        text.innerText = "Connexion...";
+        text.classList.remove('text-red-500', 'text-green-500');
+        text.classList.add('text-gray-500');
+      } else if (state.dbStatus === 'online') {
+        dot.className = "w-2 h-2 rounded-full bg-green-500";
+        text.innerText = "Synchronisé";
+        text.classList.remove('text-red-500', 'text-gray-500');
+        text.classList.add('text-green-500');
+      } else {
+        dot.className = "w-2 h-2 rounded-full bg-red-500";
+        text.innerText = "Erreur / Hors-ligne";
+        text.classList.remove('text-green-500', 'text-gray-500');
+        text.classList.add('text-red-500');
+      }
+
+      // 2. Calendrier
+      const year = state.currentMonth.getFullYear();
+      const month = state.currentMonth.getMonth();
+      document.getElementById('current-month-display').innerText = `${monthNames[month]} ${year}`;
+      
+      const grid = document.getElementById('calendar-grid');
+      grid.innerHTML = '';
+      dayNames.forEach(day => grid.innerHTML += `<div class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-2">${day}</div>`);
+
+      const firstDayIndex = (new Date(year, month, 1).getDay() + 6) % 7; 
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      const today = normalizeDate(new Date());
+
+      for (let i = 0; i < firstDayIndex; i++) grid.innerHTML += `<div class="h-10 w-10"></div>`;
+
+      for (let i = 1; i <= daysInMonth; i++) {
+        const date = new Date(year, month, i);
+        const isPast = normalizeDate(date).getTime() < today.getTime();
+        const booked = isDateBooked(date);
+        
+        let classes = "h-10 w-10 flex items-center justify-center text-sm rounded-full transition-all duration-200 mx-auto ";
+        let disabled = "";
+
+        if (isPast) { classes += "text-gray-300 cursor-not-allowed"; disabled = "disabled"; }
+        else if (booked) { classes += "bg-red-50 text-red-300 line-through cursor-not-allowed"; disabled = "disabled"; }
+        else if (isSameDay(date, state.selection.start) || isSameDay(date, state.selection.end)) { classes += "bg-[#8ba888] text-white font-bold shadow-md cursor-pointer scale-110"; }
+        else if (isDateBetween(date, state.selection.start, state.selection.end)) { classes += "bg-[#d8e3d7] text-[#2d3a2c] cursor-pointer rounded-none"; }
+        else { classes += "text-gray-700 hover:bg-gray-100 cursor-pointer"; }
+
+        const btn = document.createElement('button');
+        btn.className = classes; btn.innerText = i;
+        if (disabled) btn.disabled = true; else btn.onclick = () => handleDateClick(date);
+        grid.appendChild(btn);
+      }
+
+      // 3. Options
+      const container = document.getElementById('options-container');
+      container.innerHTML = '';
+      [{ id: 'cooler', label: 'Glacière' }, { id: 'shower', label: 'Douche' }, { id: 'bed', label: '3e lit' }].forEach(opt => {
+        const checked = state.options[opt.id];
+        const label = document.createElement('label');
+        label.className = `relative flex flex-col items-center justify-center p-4 rounded-2xl border-2 cursor-pointer transition-all select-none ${checked ? 'border-[#8ba888] bg-[#f4f7f4] text-[#2d3a2c]' : 'border-gray-100 hover:border-gray-200 text-gray-500'}`;
+        label.innerHTML = `<input type="checkbox" class="sr-only" ${checked ? 'checked' : ''}><span class="font-medium">${opt.label}</span>${checked ? `<div class="absolute top-2 right-2 text-[#8ba888]"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>` : ''}`;
+        label.onclick = (e) => { e.preventDefault(); state.options[opt.id] = !state.options[opt.id]; updateUI(); };
+        container.appendChild(label);
+      });
+
+      // 4. Formulaire
+      if (state.successMessage) {
+        document.getElementById('form-state').classList.add('hidden');
+        document.getElementById('success-state').classList.remove('hidden');
+        document.getElementById('success-state').classList.add('flex');
+        document.getElementById('success-text').innerText = state.successMessage;
+      } else {
+        document.getElementById('form-state').classList.remove('hidden');
+        document.getElementById('success-state').classList.add('hidden');
+        document.getElementById('success-state').classList.remove('flex');
+        
+        const errorEl = document.getElementById('error-message');
+        if (state.errorMsg) { errorEl.innerText = state.errorMsg; errorEl.classList.remove('hidden'); } 
+        else { errorEl.classList.add('hidden'); }
+
+        const summary = document.getElementById('selection-summary');
+        if (state.selection.start && !state.selection.end) summary.innerText = "Sélectionnez la date de fin...";
+        else if (state.selection.start && state.selection.end) summary.innerText = `Du ${state.selection.start.toLocaleDateString()} au ${state.selection.end.toLocaleDateString()}`;
+        else summary.innerText = "";
+      }
+
+      // 5. Tableau Administrateur
+      const adminDash = document.getElementById('admin-dashboard');
+      if (!state.isAdmin) {
+        adminDash.classList.add('hidden');
+      } else {
+        adminDash.classList.remove('hidden');
+        const tbody = document.getElementById('admin-bookings-list');
+        tbody.innerHTML = '';
+        if (state.bookings.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="py-8 text-center text-gray-400 font-medium">Le planning de Bob est vide pour le moment.</td></tr>';
+        } else {
+          [...state.bookings].sort((a, b) => a.start.getTime() - b.start.getTime()).forEach(booking => {
+            const opts = [];
+            if (booking.options.cooler) opts.push("Glacière");
+            if (booking.options.shower) opts.push("Douche");
+            if (booking.options.bed) opts.push("Lit");
+            
+            const tr = document.createElement('tr');
+            tr.className = "hover:bg-gray-50 transition-colors group";
+            tr.innerHTML = `
+              <td class="py-5 font-bold text-[#1a2319]">${booking.name}</td>
+              <td class="py-5 text-sm text-gray-600 font-medium">Du ${booking.start.toLocaleDateString()}<br/>au ${booking.end.toLocaleDateString()}</td>
+              <td class="py-5 text-sm text-gray-500">${opts.length > 0 ? opts.join(' • ') : '<span class="text-gray-300">Aucune</span>'}</td>
+              <td class="py-5 text-sm text-gray-600 italic break-words">${booking.comment ? `"${booking.comment}"` : '<span class="text-gray-300">-</span>'}</td>
+              <td class="py-5 text-right pr-4"><button class="px-3 py-1.5 rounded-lg text-red-500 hover:bg-red-50 font-semibold text-xs transition-colors opacity-0 group-hover:opacity-100" onclick="window.deleteBooking('${booking.id}')">Libérer</button></td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+      }
+    };
+
+    const handleDateClick = (date) => {
+      state.errorMsg = ''; state.successMessage = '';
+      const clickedDate = normalizeDate(date);
+      if (clickedDate.getTime() < normalizeDate(new Date()).getTime() || isDateBooked(clickedDate)) return;
+
+      if (!state.selection.start || (state.selection.start && state.selection.end)) {
+        state.selection = { start: clickedDate, end: null };
+      } else {
+        if (clickedDate.getTime() <= state.selection.start.getTime()) state.selection = { start: clickedDate, end: null };
+        else if (hasBookingBetween(state.selection.start, clickedDate)) {
+          state.errorMsg = "Ces dates chevauchent une réservation existante.";
+          state.selection = { start: clickedDate, end: null };
+        } else state.selection.end = clickedDate;
+      }
+      updateUI();
+    };
+
+    const handleBooking = async () => {
+      if (state.dbStatus !== 'online') {
+        state.errorMsg = "Impossible de réserver : Connexion au serveur en cours..."; updateUI(); return;
+      }
+      if (!state.selection.start || !state.selection.end) {
+        state.errorMsg = "Veuillez sélectionner une date de début et de fin."; updateUI(); return;
+      }
+      if (!state.userName.trim()) {
+        state.errorMsg = "Veuillez indiquer votre prénom."; updateUI(); return;
+      }
+
+      const newBooking = {
+        start: state.selection.start.toISOString(),
+        end: state.selection.end.toISOString(),
+        name: state.userName,
+        comment: state.comment,
+        options: { ...state.options },
+        createdAt: new Date().toISOString()
+      };
+
+      try {
+        // Envoi officiel vers Firebase dans le dossier racine 'bookings' (chemin corrigé et nettoyé)
+        const bookingsRef = collection(db, 'bookings');
+        await addDoc(bookingsRef, newBooking);
+        
+        state.successMessage = `Super ${state.userName} ! Bob est réservé du ${state.selection.start.toLocaleDateString()} au ${state.selection.end.toLocaleDateString()}.`;
+        state.selection = { start: null, end: null };
+        state.options = { cooler: false, shower: false, bed: false };
+        state.userName = ''; state.comment = ''; state.errorMsg = '';
+        document.getElementById('input-name').value = '';
+        document.getElementById('input-comment').value = '';
+        
+      } catch (error) {
+        console.error("Erreur lors de la réservation:", error);
+        state.errorMsg = "Erreur de sauvegarde. Vérifiez les règles de sécurité Firebase.";
+      }
+      updateUI();
+    };
+
+    window.deleteBooking = async (bookingId) => {
+      const result = await showModal({ title: "Annuler la réservation ?", desc: "Cela libérera les dates pour tout le monde.", confirmText: "Oui, annuler" });
+      if (result.confirmed) {
+        try {
+          await deleteDoc(doc(db, 'bookings', bookingId));
+        } catch (e) {
+          console.error(e);
+          await showModal({ title: "Erreur", desc: "Impossible d'annuler.", confirmText: "Fermer" });
+        }
+      }
+    };
+
+    window.onload = () => {
+      document.getElementById('btn-prev-month').addEventListener('click', () => { state.currentMonth = new Date(state.currentMonth.getFullYear(), state.currentMonth.getMonth() - 1, 1); updateUI(); });
+      document.getElementById('btn-next-month').addEventListener('click', () => { state.currentMonth = new Date(state.currentMonth.getFullYear(), state.currentMonth.getMonth() + 1, 1); updateUI(); });
+      document.getElementById('input-name').addEventListener('input', (e) => state.userName = e.target.value);
+      document.getElementById('input-comment').addEventListener('input', (e) => state.comment = e.target.value);
+      document.getElementById('btn-book').addEventListener('click', handleBooking);
+      document.getElementById('btn-new-booking').addEventListener('click', () => { state.successMessage = ''; updateUI(); });
+      
+      document.getElementById('btn-admin-login').addEventListener('click', async () => {
+        if (!state.isAdmin) {
+          const result = await showModal({ title: "Accès Propriétaires", desc: "Saisissez le code pour déverrouiller le planning.", showInput: true });
+          if (result.confirmed) {
+            if (result.value === state.adminCode) { state.isAdmin = true; updateUI(); setTimeout(() => document.getElementById('admin-dashboard').scrollIntoView({ behavior: 'smooth' }), 100); } 
+            else await showModal({ title: "Refusé", desc: "Code incorrect.", confirmText: "Fermer" });
+          }
+        } else document.getElementById('admin-dashboard').scrollIntoView({ behavior: 'smooth' });
+      });
+      document.getElementById('btn-admin-logout').addEventListener('click', () => { state.isAdmin = false; updateUI(); });
+
+      // -- Démarrage de la connexion Firebase --
+      const initAuth = async () => {
+        try { await signInAnonymously(auth); } 
+        catch (e) { console.error("Erreur Authentification:", e); state.dbStatus = 'error'; updateUI(); }
+      };
+      initAuth();
+
+      onAuthStateChanged(auth, (user) => {
+        if (user) {
+          state.user = user;
+          // Lecture officielle depuis le dossier 'bookings'
+          const bookingsRef = collection(db, 'bookings');
+          
+          // Ecoute des données en Temps Réel
+          onSnapshot(bookingsRef, (snapshot) => {
+            state.dbStatus = 'online';
+            state.bookings = snapshot.docs.map(doc => {
+              const data = doc.data();
+              return {
+                id: doc.id,
+                start: new Date(data.start),
+                end: new Date(data.end),
+                name: data.name,
+                comment: data.comment || '',
+                options: data.options || {}
+              };
+            });
+            updateUI();
+          }, (error) => {
+            console.error("Erreur de synchronisation Firebase:", error);
+            state.dbStatus = 'error';
+            updateUI();
+          });
+        }
+      });
+
+      updateUI();
+    };
+  </script>
+</body>
+</html><!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Réserver Bob le Van</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', sans-serif; }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+  </style>
+</head>
+<body class="bg-[#F9FAF9] text-[#2d3a2c] min-h-screen">
+
+  <div id="app-container">
+    <nav class="border-b border-gray-100 bg-white/80 backdrop-blur-md sticky top-0 z-10">
+      <div class="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+        <div class="text-2xl font-bold tracking-tight flex items-center gap-2">
+          <span class="w-8 h-8 rounded-full bg-[#8ba888] flex items-center justify-center text-white text-lg">B</span>
+          BOB.
+        </div>
+        
+        <div class="flex items-center">
+          <!-- Indicateur d'état de la base de données -->
+          <div class="flex items-center gap-2 mr-4 bg-gray-50 px-3 py-1.5 rounded-full border border-gray-100 shadow-sm transition-all" id="db-status-container">
+            <div id="db-status-dot" class="w-2 h-2 rounded-full bg-yellow-400 animate-pulse"></div>
+            <div id="db-status-text" class="text-[10px] font-bold text-gray-500 uppercase tracking-wide hidden sm:block">Connexion...</div>
+          </div>
+
+          <!-- Bouton Admin -->
+          <button id="btn-admin-login" class="p-2 text-gray-400 hover:text-[#8ba888] hover:bg-[#f2f6f2] transition-colors rounded-full" title="Accès Propriétaires">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </button>
+        </div>
+      </div>
+    </nav>
+
+    <main class="max-w-6xl mx-auto px-6 py-12">
+      <div class="flex flex-col md:flex-row gap-12 items-center mb-16">
+        <div class="flex-1 space-y-6">
+          <h1 class="text-5xl font-extrabold tracking-tight text-[#1a2319] leading-tight">
+            Prenez la route, <br/>sans vous prendre <span class="text-[#8ba888]">la tête.</span>
+          </h1>
+          <p class="text-lg text-gray-600 max-w-md leading-relaxed">
+            Vérifiez les disponibilités de Bob, choisissez vos options et réservez vos dates en quelques clics. 
+          </p>
+        </div>
+        <div class="flex-1 w-full">
+          <div class="relative rounded-3xl overflow-hidden shadow-2xl aspect-[4/3] bg-gray-200">
+            <img 
+              src="peugeot-boxer-peugeot-boxer-vert_9585905656.jpg" 
+              alt="Bob le Van" 
+              class="object-cover w-full h-full hover:scale-105 transition-transform duration-700"
+              onerror="this.onerror=null; this.src='https://placehold.co/800x600/8ba888/ffffff?text=Bob+Le+Van';"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-[2rem] shadow-xl shadow-gray-200/50 p-8 md:p-12 border border-gray-50">
+        <div class="flex items-center gap-4 mb-10">
+          <div class="p-3 bg-[#f2f6f2] rounded-2xl text-[#8ba888]">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/></svg>
+          </div>
+          <h2 class="text-3xl font-bold text-[#1a2319]">Organiser un séjour</h2>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-16">
+          
+          <!-- Colonne Gauche : Calendrier -->
+          <div class="space-y-6">
+            <div class="flex items-center justify-between mb-6 bg-[#f9faf9] p-2 rounded-2xl">
+              <button id="btn-prev-month" class="p-3 hover:bg-white rounded-xl transition-colors shadow-sm">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+              </button>
+              <h3 id="current-month-display" class="text-lg font-bold w-48 text-center">Mois Année</h3>
+              <button id="btn-next-month" class="p-3 hover:bg-white rounded-xl transition-colors shadow-sm">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+              </button>
+            </div>
+            
+            <div class="grid grid-cols-7 gap-y-4 gap-x-2 text-center" id="calendar-grid">
+              <!-- Rempli par JavaScript -->
+            </div>
+
+            <!-- Légende -->
+            <div class="flex gap-4 mt-8 text-sm text-gray-500 justify-center">
+              <span class="flex items-center gap-2"><div class="w-3 h-3 rounded-full bg-red-50 border border-red-100"></div> Indisponible</span>
+              <span class="flex items-center gap-2"><div class="w-3 h-3 rounded-full bg-[#8ba888]"></div> Sélection</span>
+            </div>
+          </div>
+
+          <!-- Colonne Droite : Options et Formulaire -->
+          <div class="flex flex-col h-full space-y-10">
+            <div class="space-y-4">
+              <h3 class="text-sm font-semibold uppercase tracking-widest text-gray-400 mb-4">Équipements optionnels</h3>
+              <div class="grid grid-cols-1 sm:grid-cols-3 gap-4" id="options-container">
+                <!-- Rempli par JavaScript -->
+              </div>
+            </div>
+
+            <div class="bg-[#f9faf9] p-6 rounded-3xl mt-auto relative overflow-hidden">
+              <!-- Message de Succès -->
+              <div id="success-state" class="hidden absolute inset-0 bg-[#f9faf9] flex-col items-center justify-center p-6 z-10 text-center space-y-4">
+                <div class="w-16 h-16 bg-[#8ba888] rounded-full flex items-center justify-center mx-auto text-white shadow-lg">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <p id="success-text" class="font-semibold text-lg"></p>
+                <button id="btn-new-booking" class="text-sm text-[#8ba888] font-medium hover:underline mt-2">
+                  Faire une nouvelle réservation
+                </button>
+              </div>
+
+              <!-- Formulaire -->
+              <div id="form-state" class="space-y-6">
+                <div>
+                  <label class="block text-sm font-semibold uppercase tracking-widest text-gray-400 mb-2">Qui réserve ?</label>
+                  <input type="text" id="input-name" placeholder="Votre prénom..." class="w-full px-5 py-4 rounded-xl border-none ring-1 ring-gray-200 focus:ring-2 focus:ring-[#8ba888] bg-white outline-none transition-all placeholder:text-gray-300 font-medium"/>
+                </div>
+
+                <div>
+                  <label class="block text-sm font-semibold uppercase tracking-widest text-gray-400 mb-2 flex justify-between items-center">
+                    <span>Message pour les proprios</span>
+                    <span class="text-xs text-gray-300 font-medium normal-case tracking-normal">Optionnel</span>
+                  </label>
+                  <textarea id="input-comment" placeholder="Une question ? La destination prévue ?" rows="2" class="w-full px-5 py-3 rounded-xl border-none ring-1 ring-gray-200 focus:ring-2 focus:ring-[#8ba888] bg-white outline-none transition-all placeholder:text-gray-300 font-medium resize-none"></textarea>
+                </div>
+
+                <p id="error-message" class="hidden text-red-500 text-sm font-medium"></p>
+
+                <button id="btn-book" class="w-full bg-[#2d3a2c] hover:bg-[#1a2319] text-white py-4 rounded-xl font-bold text-lg shadow-xl shadow-gray-900/10 transition-all hover:-translate-y-0.5 active:translate-y-0 flex justify-between items-center px-6">
+                  <span>Réserver Bob</span>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+                </button>
+
+                <p id="selection-summary" class="text-xs text-center text-gray-400 font-medium h-4"></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="admin-dashboard" class="hidden mt-16 bg-white rounded-[2rem] shadow-xl shadow-gray-200/50 p-8 md:p-12 border border-gray-50 transition-all duration-500">
+        <div class="flex flex-col md:flex-row items-start md:items-center justify-between mb-8 gap-4">
+          <div class="flex items-center gap-4">
+            <div class="p-3 bg-gray-900 rounded-2xl text-white shadow-lg">
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div>
+              <h2 class="text-2xl font-bold text-[#1a2319]">Tableau de bord Propriétaires</h2>
+              <p class="text-sm text-gray-500">Gérez les réservations et consultez les messages privés.</p>
+            </div>
+          </div>
+          <button id="btn-admin-logout" class="px-4 py-2 text-sm font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors">Verrouiller l'accès</button>
+        </div>
+        
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse min-w-[600px]">
+            <thead>
+              <tr class="border-b border-gray-100 text-sm text-gray-400 uppercase tracking-wider">
+                <th class="pb-4 font-semibold w-1/5">Locataire</th>
+                <th class="pb-4 font-semibold w-1/5">Dates</th>
+                <th class="pb-4 font-semibold w-1/5">Options</th>
+                <th class="pb-4 font-semibold w-1/3">Message privé</th>
+                <th class="pb-4 font-semibold text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody id="admin-bookings-list" class="divide-y divide-gray-50">
+              <!-- Rempli par JavaScript -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="custom-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm transition-opacity">
+    <div class="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl transform transition-transform">
+      <h3 id="modal-title" class="text-2xl font-bold text-[#1a2319] mb-2"></h3>
+      <p id="modal-desc" class="text-gray-500 mb-6 leading-relaxed"></p>
+      
+      <div id="modal-input-container" class="hidden mb-6">
+        <input type="password" id="modal-input" class="w-full px-5 py-4 rounded-xl border-none ring-1 ring-gray-200 focus:ring-2 focus:ring-[#8ba888] bg-white outline-none transition-all" placeholder="Code secret..." />
+        <p id="modal-error" class="text-red-500 text-sm mt-2 hidden font-medium">Code incorrect.</p>
+      </div>
+
+      <div class="flex gap-4 justify-end">
+        <button id="btn-modal-cancel" class="px-5 py-3 rounded-xl font-medium text-gray-500 hover:bg-gray-100 transition-colors">Annuler</button>
+        <button id="btn-modal-confirm" class="px-5 py-3 rounded-xl font-bold text-white bg-[#8ba888] hover:bg-[#7a9677] transition-colors shadow-lg">Confirmer</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, onSnapshot, addDoc, doc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
     // VOS CLÉS EXACTES (Aucune modification nécessaire)
     const firebaseConfig = {
       apiKey: "AIzaSyAY_3CtJx2nngIZlKBjiwk0EFSDGds-sB0",
